@@ -1,0 +1,137 @@
+# Agent coordination: every pull request must name an open "agent-claim" issue, and no other
+# AI agent may hold an open claim over the same files. Rules: AGENTS.md -> "Agent coordination".
+name: Agent claim check
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+jobs:
+  agent-claim:
+    name: agent-claim
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify the work claim
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Agent claim check. Runs inside actions/github-script (github, context, core are provided).
+            // Every pull request must name an open "agent-claim" issue in this repository, and no other
+            // agent may hold an open claim over the same files. This stops two AI agents (Claude,
+            // ChatGPT/SLRA, SAA, Noetis) from working on the same thing at the same time.
+            const OWNER_EXEMPT_LABEL = "claim-exempt";
+
+            function globToRegExp(glob) {
+              let out = "";
+              for (let i = 0; i < glob.length; i += 1) {
+                const ch = glob[i];
+                if (ch === "*") {
+                  if (glob[i + 1] === "*") {
+                    i += 1;
+                    if (glob[i + 1] === "/") { i += 1; out += "(?:.*/)?"; } else { out += ".*"; }
+                  } else { out += "[^/]*"; }
+                } else if (ch === "?") { out += "[^/]"; }
+                else { out += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&"); }
+              }
+              return new RegExp("^" + out + "$");
+            }
+
+            function claimField(body, name) {
+              const re = new RegExp("###\\s*" + name + "\\s*\\n+([\\s\\S]*?)(?=\\n###\\s|$)", "i");
+              const match = re.exec(String(body || ""));
+              const value = match ? match[1].trim() : "";
+              return value === "_No response_" ? "" : value;
+            }
+
+            function claimPaths(body) {
+              const raw = claimField(body, "Files or areas");
+              const lines = raw.split("\n").map((line) => line.replace(/^[-*]\s*/, "").replace(/`/g, "").trim()).filter(Boolean);
+              return lines.length ? lines : ["**"];
+            }
+
+            function pathMatches(file, patterns) {
+              return patterns.some((pattern) => {
+                const p = pattern.endsWith("/") ? pattern + "**" : pattern;
+                return globToRegExp(p).test(file) || (!/[*?]/.test(p) && file.startsWith(p.replace(/\/+$/, "") + "/"));
+              });
+            }
+
+            function expired(body, today) {
+              const value = claimField(body, "Expires");
+              if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+              return value < today;
+            }
+
+            async function run({ github, context, core, today = new Date().toISOString().slice(0, 10) }) {
+              const pr = context.payload.pull_request;
+              const { owner, repo } = context.repo;
+              const labels = (pr.labels || []).map((label) => label.name);
+              if (labels.includes(OWNER_EXEMPT_LABEL)) {
+                core.notice(`Owner exemption label "${OWNER_EXEMPT_LABEL}" present; claim check skipped.`);
+                return { status: "exempt" };
+              }
+              if (String(pr.user?.login || "").endsWith("[bot]")) {
+                core.notice("Automated dependency PR; claim check skipped.");
+                return { status: "bot" };
+              }
+
+              const ref = /^\s*Claim:\s*#(\d+)\s*$/mi.exec(String(pr.body || ""));
+              if (!ref) {
+                core.setFailed('This pull request has no work claim. Add a line "Claim: #<issue number>" to the PR description, pointing to an open "Agent work claim" issue in this repository.');
+                return { status: "missing" };
+              }
+              const claimNumber = Number(ref[1]);
+              let claim;
+              try {
+                claim = (await github.rest.issues.get({ owner, repo, issue_number: claimNumber })).data;
+              } catch (error) {
+                core.setFailed(`Claim #${claimNumber} was not found in ${owner}/${repo}.`);
+                return { status: "not_found" };
+              }
+              const claimLabels = (claim.labels || []).map((label) => (typeof label === "string" ? label : label.name));
+              if (claim.pull_request || !claimLabels.includes("agent-claim")) {
+                core.setFailed(`#${claimNumber} is not an "agent-claim" issue.`);
+                return { status: "not_claim" };
+              }
+              if (claim.state !== "open") {
+                core.setFailed(`Claim #${claimNumber} is closed. Reopen it or open a new claim before continuing.`);
+                return { status: "closed" };
+              }
+              if (expired(claim.body, today)) {
+                core.setFailed(`Claim #${claimNumber} expired on ${claimField(claim.body, "Expires")}. Renew it by editing the Expires date.`);
+                return { status: "expired" };
+              }
+              const claimBranch = claimField(claim.body, "Branch").replace(/`/g, "").trim();
+              if (claimBranch && !/^(n\/a|none|-)$/i.test(claimBranch) && claimBranch !== pr.head.ref) {
+                core.setFailed(`Claim #${claimNumber} is for branch "${claimBranch}", but this pull request is from "${pr.head.ref}".`);
+                return { status: "branch_mismatch" };
+              }
+              const myAgent = claimField(claim.body, "Agent").toLowerCase();
+
+              const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+              const changed = files.flatMap((file) => [file.filename, file.previous_filename].filter(Boolean));
+
+              const open = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: "open", labels: "agent-claim", per_page: 100 });
+              const conflicts = [];
+              for (const other of open) {
+                if (other.pull_request || other.number === claimNumber) continue;
+                if (expired(other.body, today)) continue;
+                const otherAgent = claimField(other.body, "Agent").toLowerCase();
+                if (otherAgent && otherAgent === myAgent) continue;
+                const patterns = claimPaths(other.body);
+                const overlap = changed.filter((file) => pathMatches(file, patterns));
+                if (overlap.length) conflicts.push({ number: other.number, agent: claimField(other.body, "Agent") || "unknown", files: overlap.slice(0, 5) });
+              }
+              if (conflicts.length) {
+                const lines = conflicts.map((c) => `#${c.number} (${c.agent}) also covers: ${c.files.join(", ")}`);
+                core.setFailed(`Another agent holds an open claim on files this pull request changes. Stop and coordinate with the owner before continuing.\n${lines.join("\n")}`);
+                return { status: "conflict", conflicts };
+              }
+              core.notice(`Claim #${claimNumber} (${claimField(claim.body, "Agent") || "agent"}) is open and covers this work with no overlapping claims.`);
+              return { status: "ok" };
+            }
+
+            await run({ github, context, core });

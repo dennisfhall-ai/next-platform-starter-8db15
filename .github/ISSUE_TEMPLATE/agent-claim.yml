@@ -1,0 +1,54 @@
+name: Agent work claim
+description: Claim a piece of work before any AI agent (Claude, ChatGPT/SLRA, SAA, Noetis) changes this project, so two agents never work on the same thing.
+title: "[CLAIM] "
+labels: ["agent-claim"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before opening this, check the open claims (label `agent-claim`). If another agent's open claim covers the same files or Base44 app, do not start. Report the overlap to Dennis instead.
+        Close this claim, with a link to the pull request or Base44 restore point, when the work is finished.
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent
+      description: Who is doing the work.
+      options:
+        - Claude
+        - ChatGPT / SLRA
+        - SAA
+        - Noetis
+        - Dennis
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences on what will change and why.
+    validations:
+      required: true
+  - type: textarea
+    id: paths
+    attributes:
+      label: Files or areas
+      description: One path or pattern per line (for example `src/pages/**` or `base44/functions/`). Leave empty only if the work touches the whole repository.
+      render: text
+  - type: input
+    id: branch
+    attributes:
+      label: Branch
+      description: The branch the pull request will come from, or n/a.
+  - type: input
+    id: base44
+    attributes:
+      label: Base44 app
+      description: Base44 app name and ID if the work syncs to or publishes a Base44 app, otherwise n/a.
+  - type: input
+    id: expires
+    attributes:
+      label: Expires
+      description: YYYY-MM-DD. Default is 1 day from today; renew by editing this date. Expired claims stop protecting the work.
+    validations:
+      required: true
